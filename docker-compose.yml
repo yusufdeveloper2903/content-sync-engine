@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: content-sync-engine:local
+    init: true
+    ports:
+      - '3000:3000'
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LOG_LEVEL: info
+    volumes:
+      - sync-data:/app/data
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  sync-data:

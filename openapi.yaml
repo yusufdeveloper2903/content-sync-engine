@@ -1,0 +1,429 @@
+openapi: 3.1.0
+info:
+  title: Content Sync Engine API
+  version: 1.0.0
+  description: |
+    Background job processing + ETL service that syncs JSONPlaceholder data into SQLite.
+    All errors use RFC 7807 `application/problem+json`. Every response carries an
+    `X-Request-Id` header (echoed from the request when supplied).
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Content
+  - name: Jobs
+  - name: Sync runs
+  - name: Ops
+paths:
+  /health:
+    get:
+      tags: [Ops]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  uptimeSeconds: { type: integer }
+  /ready:
+    get:
+      tags: [Ops]
+      summary: Readiness probe (database, lifecycle, workers)
+      responses:
+        '200': { $ref: '#/components/responses/Readiness' }
+        '503': { $ref: '#/components/responses/Readiness' }
+  /posts:
+    get:
+      tags: [Content]
+      summary: List posts (keyset pagination, filter, full-text search)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: userId
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: q
+          in: query
+          description: Full-text search over title and body (SQLite FTS5, prefix matching, all terms required).
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: A page of posts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, page]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Post' }
+                  page: { $ref: '#/components/schemas/PageInfo' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+  /posts/{id}:
+    get:
+      tags: [Content]
+      summary: Get a post with its author and comments (single query)
+      parameters:
+        - $ref: '#/components/parameters/IntId'
+      responses:
+        '200':
+          description: Post with relations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PostWithRelations' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /users/{id}/stats:
+    get:
+      tags: [Content]
+      summary: Aggregated statistics for a user (computed in SQL)
+      parameters:
+        - $ref: '#/components/parameters/IntId'
+      responses:
+        '200':
+          description: User statistics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserStats' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /jobs:
+    post:
+      tags: [Jobs]
+      summary: Enqueue a job
+      description: |
+        Returns `202` when a new job is enqueued. When `Idempotency-Key` matches an existing
+        job created with the same body, the original job is returned with `200` and
+        `Idempotent-Replayed: true`. Reusing a key with a different body returns `422`.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJob' }
+            examples:
+              fullSync:
+                value: { type: sync, payload: { mode: full } }
+              incrementalPosts:
+                value:
+                  {
+                    type: sync,
+                    payload: { mode: incremental, resources: [posts, comments] },
+                    priority: 10,
+                  }
+      responses:
+        '202':
+          description: Job enqueued
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '200':
+          description: Idempotent replay of an existing job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '422':
+          description: Idempotency key reused with a different request body
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      tags: [Jobs]
+      summary: List jobs (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/JobStatus' }
+        - name: type
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: A page of jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+                  page: { $ref: '#/components/schemas/PageInfo' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+  /jobs/stats:
+    get:
+      tags: [Jobs]
+      summary: Job counts by status
+      responses:
+        '200':
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: integer }
+  /jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get a job
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /jobs/{id}/retry:
+    post:
+      tags: [Jobs]
+      summary: Re-queue a dead-lettered job with a fresh attempt budget
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '202':
+          description: Job re-queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /sync-runs:
+    get:
+      tags: [Sync runs]
+      summary: Sync audit log (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: jobId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: resource
+          in: query
+          schema: { $ref: '#/components/schemas/Resource' }
+        - name: status
+          in: query
+          schema: { type: string, enum: [running, succeeded, failed] }
+      responses:
+        '200':
+          description: A page of sync runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SyncRun' }
+                  page: { $ref: '#/components/schemas/PageInfo' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+components:
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `page.nextCursor` of the previous response.
+      schema: { type: string }
+    IntId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    ValidationError:
+      description: Invalid request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: State conflict
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Readiness:
+      description: Readiness report
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              status: { type: string, enum: [ready, not_ready] }
+              checks:
+                type: object
+                additionalProperties: { type: string, enum: [ok, fail] }
+  schemas:
+    Resource:
+      type: string
+      enum: [users, posts, comments, todos]
+    JobStatus:
+      type: string
+      enum: [queued, running, succeeded, dead]
+    PageInfo:
+      type: object
+      required: [limit, nextCursor]
+      properties:
+        limit: { type: integer }
+        nextCursor: { type: [string, 'null'] }
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, example: 'urn:content-sync-engine:problem:validation-error' }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        requestId: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string, example: query.limit }
+              message: { type: string }
+    Post:
+      type: object
+      required: [id, userId, title, body]
+      properties:
+        id: { type: integer }
+        userId: { type: integer }
+        title: { type: string }
+        body: { type: string }
+    Comment:
+      type: object
+      properties:
+        id: { type: integer }
+        postId: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        body: { type: string }
+    PostWithRelations:
+      allOf:
+        - $ref: '#/components/schemas/Post'
+        - type: object
+          properties:
+            author:
+              type: [object, 'null']
+              properties:
+                id: { type: integer }
+                name: { type: string }
+                username: { type: string }
+                email: { type: string }
+            comments:
+              type: array
+              items: { $ref: '#/components/schemas/Comment' }
+    UserStats:
+      type: object
+      properties:
+        userId: { type: integer }
+        name: { type: string }
+        posts:
+          type: object
+          properties:
+            total: { type: integer }
+            avgBodyLength: { type: number }
+        comments:
+          type: object
+          properties:
+            receivedTotal: { type: integer }
+            avgPerPost: { type: number }
+            uniqueCommenters: { type: integer }
+        todos:
+          type: object
+          properties:
+            total: { type: integer }
+            completed: { type: integer }
+            completionRate: { type: number }
+        mostCommentedPost:
+          type: [object, 'null']
+          properties:
+            id: { type: integer }
+            title: { type: string }
+            comments: { type: integer }
+    CreateJob:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [sync] }
+        payload:
+          type: object
+          additionalProperties: false
+          properties:
+            mode: { type: string, enum: [full, incremental], default: incremental }
+            resources:
+              type: array
+              minItems: 1
+              items: { $ref: '#/components/schemas/Resource' }
+              description: Defaults to all resources. Always processed parent-first.
+        priority: { type: integer, minimum: -100, maximum: 100, default: 0 }
+        maxAttempts: { type: integer, minimum: 1, maximum: 25 }
+        delayMs: { type: integer, minimum: 0, maximum: 86400000 }
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        status: { $ref: '#/components/schemas/JobStatus' }
+        payload: { type: object }
+        priority: { type: integer }
+        attempts: { type: integer }
+        maxAttempts: { type: integer }
+        idempotencyKey: { type: [string, 'null'] }
+        runAt: { type: string, format: date-time }
+        lockedBy: { type: [string, 'null'] }
+        lockedUntil: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+        result: {}
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+    SyncRun:
+      type: object
+      properties:
+        id: { type: integer }
+        jobId: { type: [string, 'null'] }
+        resource: { $ref: '#/components/schemas/Resource' }
+        mode: { type: string, enum: [full, incremental] }
+        status: { type: string, enum: [running, succeeded, failed] }
+        fetched: { type: integer }
+        inserted: { type: integer }
+        updated: { type: integer }
+        unchanged: { type: integer }
+        deleted: { type: integer }
+        skipped: { type: integer }
+        error: { type: [string, 'null'] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        durationMs: { type: [integer, 'null'] }
